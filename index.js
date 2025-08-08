@@ -88,7 +88,10 @@ client.on(Events.VoiceStateUpdate, async (oldState, newState) => {
 
         if (remainingMembers.size === 0) {
             console.log('🚪 Everyone left, bot leaving...');
-            if (connection) connection.destroy();
+            const connection = getVoiceConnection(oldState.guild.id);
+            if (connection && connection.state.status !== 'destroyed') {
+                connection.destroy();
+            }
             isPlaying = false;
         }
     }
