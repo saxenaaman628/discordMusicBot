@@ -1,17 +1,17 @@
 require('dotenv').config();
 const { Client, GatewayIntentBits, Events } = require('discord.js');
-const { 
-    joinVoiceChannel, 
-    createAudioPlayer, 
-    createAudioResource, 
-    AudioPlayerStatus, 
-    NoSubscriberBehavior, 
-    getVoiceConnection,
-    StreamType 
+const {
+    joinVoiceChannel,
+    createAudioPlayer,
+    createAudioResource,
+    AudioPlayerStatus,
+    NoSubscriberBehavior,
+    getVoiceConnection
 } = require('@discordjs/voice');
-const ffmpeg = require('ffmpeg-static');
-const { spawn } = require('child_process');
+const https = require('https');
+const { PassThrough } = require('stream');
 
+// Load environment variables
 const TOKEN = process.env.BOT_TOKEN;
 const GUILD_ID = process.env.GUILD_ID;
 const CHANNEL_ID = process.env.CHANNEL_ID;
@@ -30,57 +30,43 @@ let isPlaying = false;
 let player;
 let connection;
 
-// Create a stream from MUSIC_URL using ffmpeg
-function createStream(url) {
-    return spawn(ffmpeg, [
-        '-re',               // Read input at native frame rate
-        '-i', url,           // Input URL
-        '-f', 's16le',       // PCM 16-bit
-        '-ar', '48000',      // 48kHz sample rate
-        '-ac', '2',          // 2 channels (stereo)
-        'pipe:1'             // Pipe to stdout
-    ], { stdio: ['ignore', 'pipe', 'ignore'] }).stdout;
-}
-
-// Check if any non-bot users are in the VC
+// Helper: check if users exist in voice channel
 function hasUsersInChannel() {
     const channel = client.channels.cache.get(CHANNEL_ID);
     return channel && channel.members.filter(m => !m.user.bot).size > 0;
 }
 
-// Stop music and disconnect
-function stopAndDisconnect() {
-    if (player) player.stop();
-    const conn = getVoiceConnection(GUILD_ID);
-    if (conn) conn.destroy();
-    isPlaying = false;
-    console.log('⏹️ Music stopped, bot disconnected.');
+// Helper: fetch remote MP3 stream
+function createStream(url) {
+    return new Promise((resolve, reject) => {
+        https.get(url, res => {
+            if (res.statusCode === 200) {
+                const passthrough = new PassThrough();
+                res.pipe(passthrough);
+                resolve(passthrough);
+            } else {
+                reject(new Error(`Failed to fetch stream: ${res.statusCode}`));
+            }
+        }).on('error', reject);
+    });
 }
 
-// Play music
+// Play music function
 async function playMusic() {
     try {
-        if (!connection) return;
-        const stream = createStream(MUSIC_URL);
-        const resource = createAudioResource(stream, { inputType: StreamType.Raw });
+        console.log(`▶️ Playing music from ${MUSIC_URL}`);
+        const stream = await createStream(MUSIC_URL);
+        const resource = createAudioResource(stream);
         player.play(resource);
-        console.log('▶️ Music started!');
-
-        resource.playStream.on('error', (err) => {
-            console.error('❌ Stream error:', err);
-            setTimeout(() => {
-                if (hasUsersInChannel()) playMusic();
-            }, 5000);
-        });
     } catch (err) {
-        console.error('❌ Error playing music:', err);
+        console.error("❌ Error playing music:", err);
         setTimeout(() => {
-            if (hasUsersInChannel()) playMusic();
+            if (connection && hasUsersInChannel()) playMusic();
         }, 5000);
     }
 }
 
-// Join VC and setup player
+// Join VC and start music
 function joinAndPlay() {
     connection = joinVoiceChannel({
         channelId: CHANNEL_ID,
@@ -91,19 +77,18 @@ function joinAndPlay() {
     player = createAudioPlayer({ behaviors: { noSubscriber: NoSubscriberBehavior.Stop } });
     connection.subscribe(player);
 
-    // Restart music when idle
     player.on(AudioPlayerStatus.Idle, () => {
         if (hasUsersInChannel()) {
             console.log('🔁 Music ended, restarting...');
             playMusic();
         } else {
+            console.log('⏹️ No users left, stopping music.');
             stopAndDisconnect();
         }
     });
 
-    // Retry on player error
     player.on('error', (error) => {
-        console.error('⚠️ Player error:', error.message);
+        console.error(`⚠️ Player error: ${error.message}`);
         if (hasUsersInChannel()) setTimeout(playMusic, 5000);
     });
 
@@ -111,9 +96,18 @@ function joinAndPlay() {
     isPlaying = true;
 }
 
-// Detect user join/leave in VC
+// Stop music and leave VC
+function stopAndDisconnect() {
+    if (player) player.stop();
+    const conn = getVoiceConnection(GUILD_ID);
+    if (conn) conn.destroy();
+    isPlaying = false;
+}
+
+// Voice state updates: users join/leave
 client.on(Events.VoiceStateUpdate, () => {
     if (!hasUsersInChannel() && isPlaying) {
+        console.log('🚪 Everyone left, stopping music...');
         stopAndDisconnect();
     } else if (hasUsersInChannel() && !isPlaying) {
         console.log('🎵 Users joined, starting music...');
@@ -121,16 +115,12 @@ client.on(Events.VoiceStateUpdate, () => {
     }
 });
 
-// Keep bot alive and log in
+// Ready
 client.once(Events.ClientReady, () => {
     console.log(`✅ Logged in as ${client.user.tag}`);
     if (hasUsersInChannel()) joinAndPlay();
 });
 
-// Catch unhandled errors
-process.on('unhandledRejection', console.error);
-
+// Login
 client.login(TOKEN);
 
-// Keep Node process alive for Render free tier
-process.stdin.resume();
