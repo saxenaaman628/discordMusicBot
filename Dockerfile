@@ -1,26 +1,35 @@
-# Use an official Node image (keeps compatibility with discord.js v14+)
-FROM node:18-bullseye-slim
+# ---------- Stage 1: Build Dependencies ----------
+FROM node:18-alpine AS builder
 
-# Install ffmpeg (required for audio streaming) and cleanup apt cache
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends ffmpeg ca-certificates && \
-    rm -rf /var/lib/apt/lists/*
+# Install ffmpeg & required tools
+RUN apk add --no-cache ffmpeg
 
-# Create app directory and use non-root 'node' user
+# Create app directory
 WORKDIR /usr/src/app
-# Copy package manifests first for better layer caching
+
+# Copy package files first
 COPY package*.json ./
 
-# Install dependencies (use npm ci if package-lock.json is present)
-RUN if [ -f package-lock.json ]; then npm ci --only=production; else npm install --only=production; fi
+# Install dependencies (production only)
+RUN npm ci --only=production
 
-# Copy app source
+# Copy source code
 COPY . .
 
-# Ensure node owns the files
-RUN chown -R node:node /usr/src/app
+# ---------- Stage 2: Final Lightweight Image ----------
+FROM node:18-alpine
+
+# Install ffmpeg in final image
+RUN apk add --no-cache ffmpeg
+
+# Set working directory
+WORKDIR /usr/src/app
+
+# Copy only the built app & node_modules from builder
+COPY --from=builder /usr/src/app /usr/src/app
+
+# Use non-root user
 USER node
 
-# Use environment variables for token, channel id and url. Don't hardcode secrets in image.
-# The container will run your bot entry file (bot.js)
+# Run bot
 CMD ["node", "index.js"]

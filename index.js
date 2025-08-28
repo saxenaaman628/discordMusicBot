@@ -8,11 +8,18 @@ const {
     NoSubscriberBehavior,
     getVoiceConnection
 } = require('@discordjs/voice');
-const play = require('play-dl');
+const https = require('https');
 
+// Load environment variables
 const TOKEN = process.env.BOT_TOKEN;
-const TARGET_CHANNEL_ID = process.env.VC_ID;
-const MUSIC_URL = process.env.YOUTUBE_URL;
+const GUILD_ID = process.env.GUILD_ID;
+const CHANNEL_ID = process.env.CHANNEL_ID;
+const MUSIC_URL = process.env.MUSIC_URL;
+
+if (!TOKEN || !GUILD_ID || !CHANNEL_ID || !MUSIC_URL) {
+    console.error("❌ Missing required environment variables in .env file!");
+    process.exit(1);
+}
 
 const client = new Client({
     intents: [
@@ -22,78 +29,101 @@ const client = new Client({
 });
 
 let isPlaying = false;
-let player; // Keep a single player instance
+let player;
 let connection;
-let retryCount = 0
 
 client.once(Events.ClientReady, () => {
     console.log(`✅ Logged in as ${client.user.tag}`);
 });
 
+function createStream(url) {
+    return https.get(url, (res) => {
+        if (res.statusCode !== 200) {
+            console.error(`❌ Stream error: ${res.statusCode}`);
+            return null;
+        }
+        return res;
+    });
+}
+
 async function playMusic() {
     try {
-        console.log(`▶️ Starting music from ${MUSIC_URL}`);
-        const stream = await play.stream(MUSIC_URL);
-        const resource = createAudioResource(stream.stream, { inputType: stream.type });
+        console.log(`▶️ Playing music from ${MUSIC_URL}`);
+        const stream = createStream(MUSIC_URL);
+
+        if (!stream) {
+            console.log("⏳ Stream not available, retrying in 5 seconds...");
+            setTimeout(() => {
+                if (connection && hasUsersInChannel()) playMusic();
+            }, 5000);
+            return;
+        }
+
+        const resource = createAudioResource(MUSIC_URL);
         player.play(resource);
     } catch (err) {
         console.error("❌ Error playing music:", err);
-        console.log("⏳ Retrying in 5 seconds...");
-        setTimeout(playMusic, 5000); // Retry after 5 seconds if error
+        setTimeout(() => {
+            if (connection && hasUsersInChannel()) playMusic();
+        }, 5000);
     }
 }
 
-client.on(Events.VoiceStateUpdate, async (oldState, newState) => {
-    const channel = newState.guild.channels.cache.get(TARGET_CHANNEL_ID);
+function hasUsersInChannel() {
+    const channel = client.channels.cache.get(CHANNEL_ID);
+    return channel && channel.members.filter(m => !m.user.bot).size > 0;
+}
 
-    // User joins target channel
-    if (newState.channelId === TARGET_CHANNEL_ID && oldState.channelId !== TARGET_CHANNEL_ID) {
-        const nonBotMembers = channel.members.filter(m => !m.user.bot);
+function joinAndPlay() {
+    connection = joinVoiceChannel({
+        channelId: CHANNEL_ID,
+        guildId: GUILD_ID,
+        adapterCreator: client.guilds.cache.get(GUILD_ID).voiceAdapterCreator,
+    });
 
-        if (!isPlaying && nonBotMembers.size > 0) {
-            console.log(`🎵 First user joined ${channel.name}, bot joining...`);
-            isPlaying = true;
+    player = createAudioPlayer({ behaviors: { noSubscriber: NoSubscriberBehavior.Stop } });
+    connection.subscribe(player);
 
-            connection = joinVoiceChannel({
-                channelId: TARGET_CHANNEL_ID,
-                guildId: newState.guild.id,
-                adapterCreator: newState.guild.voiceAdapterCreator,
-            });
-
-            player = createAudioPlayer({ behaviors: { noSubscriber: NoSubscriberBehavior.Stop } });
-            connection.subscribe(player);
-
-            // Song finished → replay
-            player.on(AudioPlayerStatus.Idle, () => {
-                console.log('🎶 Song finished, restarting...', retryCount);
-                retryCount++
-                playMusic();
-            });
-
-            // Error → retry
-            player.on('error', error => {
-                console.error(`⚠️ Player error: ${error.message}`, retryCount);
-                retryCount++
-                playMusic();
-            });
-
-            await playMusic();
+    // Restart if idle
+    player.on(AudioPlayerStatus.Idle, () => {
+        if (hasUsersInChannel()) {
+            console.log('🎶 Stream ended, restarting...');
+            playMusic();
+        } else {
+            console.log('⏹️ No users left, stopping music.');
+            stopAndDisconnect();
         }
+    });
+
+    // Retry on error
+    player.on('error', (error) => {
+        console.error(`⚠️ Player error: ${error.message}`);
+        if (hasUsersInChannel()) setTimeout(playMusic, 5000);
+    });
+
+    playMusic();
+    isPlaying = true;
+}
+
+function stopAndDisconnect() {
+    if (player) player.stop();
+    const conn = getVoiceConnection(GUILD_ID);
+    if (conn) conn.destroy();
+    isPlaying = false;
+}
+
+client.on(Events.VoiceStateUpdate, (oldState, newState) => {
+    const channel = client.channels.cache.get(CHANNEL_ID);
+    if (!channel) return;
+
+    if (!hasUsersInChannel() && isPlaying) {
+        console.log('🚪 Everyone left, stopping music...');
+        stopAndDisconnect();
     }
 
-    // User leaves target channel
-    if (oldState.channelId === TARGET_CHANNEL_ID && newState.channelId !== TARGET_CHANNEL_ID) {
-        const oldChannel = oldState.guild.channels.cache.get(TARGET_CHANNEL_ID);
-        const remainingMembers = oldChannel.members.filter(m => !m.user.bot);
-
-        if (remainingMembers.size === 0) {
-            console.log('🚪 Everyone left, bot leaving...');
-            const connection = getVoiceConnection(oldState.guild.id);
-            if (connection && connection.state.status !== 'destroyed') {
-                connection.destroy();
-            }
-            isPlaying = false;
-        }
+    if (hasUsersInChannel() && !isPlaying) {
+        console.log('🎵 Users joined, starting music...');
+        joinAndPlay();
     }
 });
 
