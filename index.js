@@ -8,8 +8,8 @@ const {
     NoSubscriberBehavior,
     getVoiceConnection
 } = require('@discordjs/voice');
+const express = require('express');
 const https = require('https');
-const { PassThrough } = require('stream');
 
 // Load environment variables
 const TOKEN = process.env.BOT_TOKEN;
@@ -23,40 +23,53 @@ if (!TOKEN || !GUILD_ID || !CHANNEL_ID || !MUSIC_URL) {
 }
 
 const client = new Client({
-    intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates]
+    intents: [
+        GatewayIntentBits.Guilds,
+        GatewayIntentBits.GuildVoiceStates
+    ]
 });
 
 let isPlaying = false;
 let player;
 let connection;
 
-// Helper: check if users exist in voice channel
-function hasUsersInChannel() {
-    const channel = client.channels.cache.get(CHANNEL_ID);
-    return channel && channel.members.filter(m => !m.user.bot).size > 0;
-}
+// --- Express HTTP server for Render ---
+const app = express();
+const PORT = process.env.PORT || 3000;
 
-// Helper: fetch remote MP3 stream
+app.get('/', (req, res) => {
+    res.send('🎵 Discord Music Bot is running!');
+});
+
+app.listen(PORT, () => {
+    console.log(`✅ HTTP server running on port ${PORT}`);
+});
+
+// --- Bot logic ---
 function createStream(url) {
-    return new Promise((resolve, reject) => {
-        https.get(url, res => {
-            if (res.statusCode === 200) {
-                const passthrough = new PassThrough();
-                res.pipe(passthrough);
-                resolve(passthrough);
-            } else {
-                reject(new Error(`Failed to fetch stream: ${res.statusCode}`));
-            }
-        }).on('error', reject);
+    return https.get(url, (res) => {
+        if (res.statusCode !== 200) {
+            console.error(`❌ Stream error: ${res.statusCode}`);
+            return null;
+        }
+        return res;
     });
 }
 
-// Play music function
 async function playMusic() {
     try {
         console.log(`▶️ Playing music from ${MUSIC_URL}`);
-        const stream = await createStream(MUSIC_URL);
-        const resource = createAudioResource(stream);
+        const stream = createStream(MUSIC_URL);
+
+        if (!stream) {
+            console.log("⏳ Stream not available, retrying in 5 seconds...");
+            setTimeout(() => {
+                if (connection && hasUsersInChannel()) playMusic();
+            }, 5000);
+            return;
+        }
+
+        const resource = createAudioResource(MUSIC_URL);
         player.play(resource);
     } catch (err) {
         console.error("❌ Error playing music:", err);
@@ -66,7 +79,11 @@ async function playMusic() {
     }
 }
 
-// Join VC and start music
+function hasUsersInChannel() {
+    const channel = client.channels.cache.get(CHANNEL_ID);
+    return channel && channel.members.filter(m => !m.user.bot).size > 0;
+}
+
 function joinAndPlay() {
     connection = joinVoiceChannel({
         channelId: CHANNEL_ID,
@@ -79,7 +96,7 @@ function joinAndPlay() {
 
     player.on(AudioPlayerStatus.Idle, () => {
         if (hasUsersInChannel()) {
-            console.log('🔁 Music ended, restarting...');
+            console.log('🎶 Stream ended, restarting...');
             playMusic();
         } else {
             console.log('⏹️ No users left, stopping music.');
@@ -96,7 +113,6 @@ function joinAndPlay() {
     isPlaying = true;
 }
 
-// Stop music and leave VC
 function stopAndDisconnect() {
     if (player) player.stop();
     const conn = getVoiceConnection(GUILD_ID);
@@ -104,23 +120,23 @@ function stopAndDisconnect() {
     isPlaying = false;
 }
 
-// Voice state updates: users join/leave
-client.on(Events.VoiceStateUpdate, () => {
+client.on(Events.VoiceStateUpdate, (oldState, newState) => {
+    const channel = client.channels.cache.get(CHANNEL_ID);
+    if (!channel) return;
+
     if (!hasUsersInChannel() && isPlaying) {
         console.log('🚪 Everyone left, stopping music...');
         stopAndDisconnect();
-    } else if (hasUsersInChannel() && !isPlaying) {
+    }
+
+    if (hasUsersInChannel() && !isPlaying) {
         console.log('🎵 Users joined, starting music...');
         joinAndPlay();
     }
 });
 
-// Ready
 client.once(Events.ClientReady, () => {
     console.log(`✅ Logged in as ${client.user.tag}`);
-    if (hasUsersInChannel()) joinAndPlay();
 });
 
-// Login
 client.login(TOKEN);
-
